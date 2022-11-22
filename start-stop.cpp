@@ -12,14 +12,10 @@
 
 using namespace std::chrono_literals;
 
-std::atomic<bool> acquire{false};
-std::counting_semaphore<1> sem{0};
-
 class SleepTimer {
     std::random_device rd;
     std::mt19937 e2{rd()};
     std::uniform_real_distribution<> dist{1, 3};
-
   public:
     void random_sleep() {
         auto t = std::chrono::duration<double>(dist(e2));
@@ -27,6 +23,16 @@ class SleepTimer {
     }
     void sleep(std::chrono::nanoseconds t) { std::this_thread::sleep_for(t); }
 };
+
+
+std::atomic<bool> acquire{false};
+std::counting_semaphore<1> sem{0};
+std::mutex m;
+SleepTimer timer;
+
+//Global to avoid issues around shm (TODO! should not be needed!!!)
+//construction messes with the shm
+sls::Detector det;
 
 void acquire_task(std::stop_token stop_token) {
     sls::Detector d;
@@ -54,35 +60,43 @@ void start() {
 void stop() {
     fmt::print("stop()        \n"); //space to overwrite % in acquire printout
     acquire = false;
-    sls::Detector d;
-    d.stopDetector();
-    d.stopReceiver();
+    det.stopDetector();
+    det.stopReceiver();
+    
 
     // Exit if stop failed
-    auto status = d.getDetectorStatus().squash();
-    if(status != sls::defs::runStatus::IDLE){
-        fmt::print(fmt::fg(fmt::color::red), "Detector not idle after stop! Exiting\n");
-        exit(EXIT_FAILURE);
+    int stop_counter{0};
+    bool check_status{true};
+    while(check_status){
+        check_status = false;
+        for (const auto& s : det.getDetectorStatus()){
+            if(s!=sls::defs::runStatus::IDLE){
+                fmt::print(fmt::fg(fmt::color::red), "Detector status: {}, after stop!\n", sls::ToString(s));
+                check_status = true; //one is not idle have a second look
+                ++stop_counter;
+                timer.sleep(100ms);
+            }
+        }
+        if (stop_counter > 500){
+            fmt::print("Could not stop detector - Exiting\n");
+            exit(EXIT_FAILURE);
+        }
     }
+
     fmt::print("stop() - done\n");
 }
 
 int main() {
-    int max_iter = 5;
+    int max_iter = 10;
 
-    // sem.release();
-    SleepTimer s;
-    std::atomic<bool> acquire_flag{false};
     std::jthread t(acquire_task);
-    s.sleep(500ms);
-
+    timer.sleep(500ms);
     for (int i = 0; i != max_iter; ++i) {
         start();
-        s.random_sleep();
+        timer.random_sleep();
         stop();
-        s.sleep(100ms);
+        timer.sleep(300ms); //wait a reasonable time before starting again
     }
-
     // To exit we need to request stop and then release the
     // semaphore since the acquire_task might be waiting
     t.request_stop();
